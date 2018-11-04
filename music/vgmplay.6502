@@ -912,7 +912,7 @@ ALIGN &100
 ;INCBIN "run_under_fire.exo"
 ;INCBIN "repton.exo"
 ;INCBIN "fluid.exo"
-INCBIN "tumbq16k.exo"
+INCBIN "tumb16k.exo"
 .end_of_data
 
 
