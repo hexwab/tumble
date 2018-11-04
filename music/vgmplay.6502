@@ -1,0 +1,944 @@
+\ ******************************************************************
+\ *	VGM player v2 including Exomizer decrunch on demand at runtime
+\ * 24 Jan 2016 - Kieran Connell
+\ ******************************************************************
+
+\\ Notes
+\\ 8us delay = 8x NOP
+\\ 44.1kHz sample time
+\\ 0x50 dd = SN76489 write value dd
+\\ 0x63 = wait 882 samples = 20ms (short for 0x61 0x73 0x03 )
+\\ 0x61 lo hi = wait n samples (at 44.1kHz) = n / 44100 seconds
+\\ = n / 44.1 ms = n / 0.0441 us = n * 22.6757469.. us
+\\ n = 256 * hi + lo => wait in us = (256 * hi + lo) * 22.675
+\\ = 256 * (hi * 22.6757) + lo * 22.6757
+
+\\ 65535 samples = 1485974 (lookup) us = 1.485974 s
+\\ 65535 samples / 44100 = 1.48605 s
+
+\\ Max data = 3x channels x 3x bytes data + 1x byte noise = 10 bytes
+\\ Max sample rate = 50Hz = 20us
+\\ Max data rate = 10 bytes per 20us = 500 bytes/sec = 30k bytes/min!
+\\ Actual data rate appears to be approximately half this, although
+\\ includes command stream (+1 bytes per vgm instruction)
+\\ Including command stream ~60k bytes/min (actual ~15-18k/min)
+
+\\ gzip of a typical vgm file reduces to about 28% of original so
+\\ this is likely to be the limit of entropy (Exomiser can get close
+\\ or even beat this, depending on working buffer size.)
+\\ E.g. Firetrack=40783; gzip=9535; exomizer 1024b buffer=15737
+
+\\ See Exomizer website: http://hem.bredband.net/magli143/exo/
+\\ Added support for 60Hz delay command (&62)
+
+\\ New version. Decompress VGM file and push decoded instructions into
+\\ a circular buffer.  This is only processed during the timer
+\\ interupt routine, so there is only ever one place that sets timer
+\\ latches.  Store pointers for read / write / future latch into here.
+
+\\ Increased accuracy of us timer as was missing 8 bits from high
+\\ byte sample lookup.  Also removed sub 256 us timers as not really
+\\ feasible on Beeb and not noticable by ear.
+
+\\ Given amount of processing that happens to convert to Beeb friendly
+\\ stream format at run-time, conclusion is this should probably be
+\\ moved to a preprocessing step and create a compress Beeb VGM file. 
+
+\ ******************************************************************
+\ *	Define OS entries (could be INCLUDE bbc_os.h)
+\ ******************************************************************
+
+oswrch = &FFEE
+osasci = &FFE3
+osbyte = &FFF4
+osword = &FFF1
+
+INKEY_esc = 112
+
+\ ******************************************************************
+\ *	Define debug flags (prefer DEBUG_* naming?)
+\ ******************************************************************
+
+	IntCA1 =  2 \\ CA1 active edge
+	SysIntVSync = IntCA1 \\ 6845 vsync
+	SystemVIA = &FE40
+	ViaIFR  = 13 \\ Interrupt Flag    Register // b7:any/all   b6:timer1 b5:timer2 b4:CB1 b3:CB2 b2:ShiftReg B1:CA1 b0:CA2
+	SysViaIFR  = SystemVIA+ViaIFR  \\ D Interrupt Flag    Register // b7:any/all   b6:timer1 b5:timer2 b4:CB1-ADC-EndOfConv b3:CB2-light-pen-strobe * (AUG414)
+
+\ ******************************************************************
+\ *	Define macros (prefer MACRO_* naming?)
+\ ******************************************************************
+
+MACRO SN_WRITE_ENABLE
+	LDX #&00: STX &FE40			; R0=Output Register "B" (write) (write 1 into bit 0 - write to sound chip)
+	NOP:NOP:NOP:NOP:NOP:NOP		; wait 8us (following LDX instruction takes 2 cycles)
+	LDX #&08: STX &FE40			; set sound chip write pin high
+ENDMACRO
+
+\ ******************************************************************
+\ *	Define global constants
+\ ******************************************************************
+
+buffer_len = 16384
+
+VGM_write_sound_data = &50
+VGM_wait_50_Hz = &63
+VGM_wait_60_Hz = &62
+VGM_wait_N_samples = &61
+VGM_end_of_stream = &66
+VGM_wait_N_us = &41				; my own extension, not standard
+
+\ ******************************************************************
+\ *	Define fast (zero page) runtime variables
+\ ******************************************************************
+
+zp_src_hi = $70
+zp_src_lo = zp_src_hi + 1
+zp_src_bi = zp_src_hi + 2
+zp_bitbuf = zp_src_hi + 3
+
+zp_len_lo  = $74
+zp_len_hi  = zp_len_lo + 1
+
+zp_bits_lo = $76
+zp_bits_hi = zp_bits_lo + 1
+
+zp_dest_hi = $78
+zp_dest_lo = zp_dest_hi + 1	; dest addr lo
+zp_dest_bi = zp_dest_hi + 2	; dest addr hi
+
+ORG &80
+GUARD &90
+
+.read_ptr				SKIP 2			; ptr to current sound instruction
+.write_ptr				SKIP 2			; ptr to write location in circular buffer
+.latch_ptr				SKIP 2			; ptr to next timer instructoin
+
+.long_timer				SKIP 3			; 24-bit ms timer
+.end_of_stream			SKIP 1			; decompressor hit end of stream
+.player_ended			SKIP 1			; player hit end instruction
+.old_irqv				SKIP 2			; restore old IRQV on exit
+
+\\ Generic vars that can be shared (volatile)
+
+\ ******************************************************************
+\ *	Start address to be saved
+\ ******************************************************************
+
+ORG &1900	      					; code origin (like P%=&2000)
+GUARD &7C00							; ensure code size doesn't hit start of screen memory
+
+.start
+
+\ ******************************************************************
+\ *	Code entry
+\ ******************************************************************
+
+\ ******************************************************************
+\ *	Main loop sequencing tick & draw code
+\ ******************************************************************
+
+.main
+{
+	\\ Set MODE 7 for memory
+	;LDA #22
+	;JSR oswrch
+	;LDA #7
+	;JSR oswrch
+	LDA #4
+	STA &F4
+	STA &FE30
+	
+	\\ Initialise exomizer
+	JSR init_decruncher
+
+	\\ Initalise system vars
+
+	LDA #LO(circular_buffer)
+	STA read_ptr
+	STA write_ptr
+	STA latch_ptr
+	LDA #HI(circular_buffer)
+	STA read_ptr+1
+	STA write_ptr+1
+	STA latch_ptr+1
+	
+	LDA #0
+	STA end_of_stream
+	STA player_ended
+	
+	\\ Need to parse header correctly
+	\\ TO-DO
+	
+	\\ Fill our circular buffer with initial data
+	
+	.fill_buffer_loop
+	JSR read_next_instruction
+	bcs find_first_wait
+	
+	SEC
+	LDA write_ptr
+	SBC read_ptr
+	BPL fill_buffer_loop
+
+	\\ Find first wait instruction
+	.find_first_wait
+	LDY #0
+	.find_wait_loop
+	LDA (latch_ptr),Y
+	INC latch_ptr
+	CMP #VGM_write_sound_data: BNE test_wait
+	INC latch_ptr				; skip sound data
+	JMP find_wait_loop
+	.test_wait
+	CMP #VGM_wait_N_us
+	BNE find_wait_loop
+	.found_wait
+
+	;LDA read_ptr
+	;JSR write_A_trash_X
+	;LDA read_ptr+1
+	;JSR write_A_trash_X
+
+	;LDA write_ptr
+	;JSR write_A_trash_X
+	;LDA write_ptr+1
+	;JSR write_A_trash_X
+	
+	;LDA latch_ptr
+	;JSR write_A_trash_X
+	;LDA latch_ptr+1
+	;JSR write_A_trash_X
+
+	;LDA #10: JSR oswrch: LDA #13: JSR oswrch
+
+	\\ Set initial timer		; do we need this?!
+	SEI							; disable interupts
+	
+	LDA #&7F					; A=01111111
+	STA &FE4E					; R14=Interrupt Enable (disable all interrupts)
+
+	;LDA #&C2					; A=11000010
+	LDA #&C0					; A=11000010
+	STA &FE4E					; R14=Interrupt Enable (enable timer 1 + vsync interrupts)
+
+	LDA #64						; A=01000000
+	STA &FE4B					; R11=Auxillary Control Register (timer 1 latch mode)
+
+	LDX #&FF					; X=11111111
+	STX &FE44					; R4=T1 Low-Order Latches (write)
+	STX &FE45					; R5=T1 High-Order Counter
+	;CLI
+
+	\\ Set initial latch
+	;SEI
+	LDA (latch_ptr),Y
+	INC latch_ptr
+	STA &FE46
+	LDA (latch_ptr),Y
+	INC latch_ptr
+	STA &FE47
+
+	;LDA &204: STA old_irqv
+	;LDA &205: STA old_irqv+1
+	
+	;LDA #LO(main_irq):STA &204
+	;LDA #HI(main_irq):STA &205		; set interrupt handler
+
+	;CLI							; enable interupts
+	SEI
+	\\ Sit and watch the pointers as player runs
+	
+	.main_loop
+	LDA #&40
+	BIT &FE4D
+	BEQ notirq
+	JMP irqtimer
+	.*notirq
+	BIT end_of_stream
+	BMI drain
+	SEC
+	LDA write_ptr
+	SBC read_ptr
+	CMP #248
+	BCS main_loop
+	
+	JSR read_next_instruction
+	BCC main_loop
+	
+	LDA #&FF
+	STA end_of_stream
+	BNE main_loop
+
+	.drain
+	
+	; lda #&02
+	; .wait_vsync
+	; bit &FE4D
+	; beq wait_vsync
+	
+	LDA read_ptr
+	CMP write_ptr
+	BNE main_loop
+
+	\\ Clean up
+	;.hlt jmp hlt
+	\\ Zero volume on all channels
+	;SEI
+	;LDX #&FF: STX &FE43					; R3=Data Direction Register "A" set to output
+	;LDA #&9F: STA &FE41					; tone 3 volume OFF
+	;SN_WRITE_ENABLE
+	;LDA #&BF: STA &FE41					; tone 2 volume OFF
+	;SN_WRITE_ENABLE
+	;LDA #&DF: STA &FE41					; tone 1 volume OFF
+	;SN_WRITE_ENABLE
+	;LDA #&FF: STA &FE41					; noise volume OFF
+	;SN_WRITE_ENABLE
+	
+	LDA #&FF					; A=11111111
+	STA &FE4E					; R14=Interrupt Enable (enable all interrupts)
+	
+	;LDA old_irqv: STA &204
+	;LDA old_irqv+1: STA &205
+	CLI
+	
+	RTS
+}
+
+	
+.read_next_instruction
+{
+	jsr get_decrunched_byte
+	bcs _sample_end
+	
+	LDY #0
+	
+	CMP #VGM_write_sound_data: BEQ write_sound_data		; write data byte to SN instruction
+	CMP #VGM_wait_N_samples: BEQ wait_samples			; wait LL HH samples
+	CMP #VGM_wait_50_Hz: BEQ wait_20_ms			; wait 20ms instruction
+	CMP #VGM_wait_60_Hz: BEQ wait_16_ms			; wait 60Hz instruction
+	CMP #VGM_end_of_stream: BNE unsupported			; end of stream instruction
+
+	._sample_end
+	STA (write_ptr),Y					; store sound command
+	INC write_ptr						; no carry
+	SEC
+	RTS
+
+	\\ Could parse other instructions here but still ignore
+	.unsupported
+;	JSR write_A_trash_X					; unsupported instruction
+	CLC
+	RTS
+	
+	.write_sound_data
+	STA (write_ptr),Y					; store sound command
+	INC write_ptr						; no carry
+	
+	jsr get_decrunched_byte
+	bcs _sample_end
+
+	STA (write_ptr),Y					; store sound data
+	INC write_ptr
+	
+	CLC
+	RTS
+	
+	\\ Wait exactly 20 ms
+	.wait_20_ms
+	LDA #VGM_wait_N_us
+	STA (write_ptr),Y					; store wait ms command
+	INC write_ptr						; no carry
+	
+	LDA #&20-2
+	STA (write_ptr),Y					; store wait ms low
+	INC write_ptr						; no carry
+	
+	LDA #&4E							; &4E20 = 20,000 us = 2ms = 50Hz (maybe need -2)
+	STA (write_ptr),Y					; store wait ms high
+	INC write_ptr						; no carry
+	
+	CLC
+	RTS
+	
+	\\ Wait exactly 60Hz
+	.wait_16_ms
+	LDA #VGM_wait_N_us				
+	STA (write_ptr),Y					; store wait ms command
+	INC write_ptr						; no carry
+	
+	LDA #&1B-2
+	STA (write_ptr),Y					; store wait ms low
+	INC write_ptr						; no carry
+	
+	LDA #&41							; &411B = 16,667 us ~= 60Hz (maybe need -2)
+	STA (write_ptr),Y					; store wait ms high
+	INC write_ptr						; no carry
+	
+	CLC
+	RTS
+
+	\\ Wait a number of samples
+	.wait_samples
+	jsr get_decrunched_byte				; low byte #samples
+	;bcs _sample_end
+
+	TAX
+	LDA samples_to_us_LO,X
+	STA long_timer						; lowest byte
+
+	LDA samples_to_us_HI,X
+	STA long_timer+1					; mid byte
+	
+	jsr get_decrunched_byte				; high byte #samples
+	;bcs _sample_end
+
+	TAX
+	CLC
+	LDA samples_to_us_ERR,X				; error from high byte approximateion
+	ADC long_timer
+	STA long_timer						; lowest byte - should probably -2!
+	
+	LDA samples_to_us_LO,X				; mid byte
+	ADC long_timer+1
+	STA long_timer+1					; mid byte
+	
+	LDA samples_to_us_HI,X
+	ADC #0
+	STA long_timer+2					; highest byte
+
+	\\ If only have low byte (<256 us) delay then just don't do it
+	BNE write_long_wait
+	LDA long_timer+1
+	ORA long_timer
+	BNE write_last_wait
+	BEQ wait_too_short
+	
+	.write_long_wait
+	TAX
+	.long_wait_loop
+	LDA #VGM_wait_N_us
+	STA (write_ptr),Y					; store wait us command
+	INC write_ptr						; no carry
+
+	LDA #&FE
+	STA (write_ptr),Y					; store wait us low
+	INC write_ptr						; no carry
+
+	LDA #&FF							; &FFFE = 65534 us = &10000 - 2 us
+	STA (write_ptr),Y					; store wait us high
+	INC write_ptr						; no carry
+
+	DEX
+	BNE long_wait_loop
+	
+	.write_last_wait
+	LDA #VGM_wait_N_us
+	STA (write_ptr),Y					; store wait us command
+	INC write_ptr						; no carry
+
+	LDA long_timer
+	STA (write_ptr),Y					; store wait us low
+	INC write_ptr						; no carry
+
+	LDA long_timer+1
+	STA (write_ptr),Y					; store wait us high
+	INC write_ptr						; no carry
+	
+	.wait_too_short
+	CLC									; clear carry flag
+	RTS
+}
+
+.write_A_trash_X
+{
+	PHA:PHA
+	LSR A:LSR A:LSR A:LSR A
+	TAX
+	LDA chars,X
+	JSR oswrch
+	PLA
+	AND #&0F
+	TAX
+	LDA chars,X
+	JSR oswrch
+	LDA #32
+	JSR oswrch
+	PLA
+	RTS
+}
+
+.main_input
+{
+	\\ Check for escape, if so break
+	LDA #INKEY_esc:STA &FE4F:LDA &FE4F:BMI main_break
+	
+	.return
+	RTS
+
+	.main_break
+	JMP (&FFFC)
+}
+
+
+\ ******************************************************************
+\ *	IRQ handler
+\ ******************************************************************
+
+.main_irq
+{
+	TXA:PHA
+	TYA:PHA
+	
+	LDA #&40:BIT &FE4D:BEQ irqvsync
+.*irqtimer
+	STA &FE4D					; clear time-out of T1 in IFR
+
+	LDA player_ended
+	BNE return
+	
+	\\ When timer lands we process our read ptr and send sound data until we hit something else
+	
+	LDX #&FF: STX &FE43					; R3=Data Direction Register "A" set to output
+	
+	LDY #0
+	.sound_loop
+	LDA (read_ptr),Y
+	INC read_ptr
+	CMP #VGM_write_sound_data: BNE not_sound
+	LDA (read_ptr),Y
+	INC read_ptr
+
+	;SEI
+	STA &FE41							; send sound data to SN chip
+	SN_WRITE_ENABLE
+	;CLI
+	BNE sound_loop
+	
+	.not_sound
+	CMP #VGM_wait_N_us: BNE not_wait				; this only happens at end of stream
+
+	\\ Swallow wait instruction
+	INC read_ptr
+	INC read_ptr
+	JMP find_wait_loop
+	
+	.not_wait
+	CMP #VGM_end_of_stream: BNE find_wait_loop		; shouldn't be any unknown instructions
+	
+	\\ Finished playing here - need to clean up!
+	
+	LDA #&FF
+	STA player_ended
+	JMP return
+	
+	.find_wait_loop
+	LDA (latch_ptr),Y
+	INC latch_ptr
+	CMP #VGM_write_sound_data: BNE test_wait
+	INC latch_ptr				; consume sound data as we don't care about it
+	JMP find_wait_loop
+	.test_wait
+	CMP #VGM_wait_N_us: BNE return
+
+	\\ Set future latch
+	;SEI
+	LDA (latch_ptr),Y
+	;JSR write_A_trash_X
+	INC latch_ptr
+	SEC
+	SBC #2
+	STA &FE46
+	LDA (latch_ptr),Y
+	SBC #0
+	STA &FE47
+	;JSR write_A_trash_X
+	;JSR &FFE7
+	INC latch_ptr
+	;CLI
+
+	.return
+	JMP notirq
+	;JMP return
+
+	.irqvsync
+	JMP return
+	LDA #&02
+	STA &FE4D
+
+	LDA end_of_stream
+	BNE return
+	
+	.decode_loop					; fill buffer until write_ptr catches up with read_ptr - 16?! :\
+	SEC
+	LDA write_ptr
+	SBC read_ptr
+	BMI return
+	
+	JSR read_next_instruction		; note this is not decoding bytes but instructions (2 - 3 bytes)
+	BCC decode_loop
+	
+	LDA #&FF
+	STA end_of_stream
+
+	;.return
+	;JMP notirq
+	RTS
+	PLA:TAY
+	PLA:TAX
+	LDA &FC
+	RTI
+}
+
+
+; -------------------------------------------------------------------
+; for this get_crunched_byte routine to work the crunched data has to be
+; crunced using the -m <buffersize> and possibly the -l flags. Any other
+; flag will just mess things up.
+.get_crunched_byte
+{
+	INC _byte_lo
+	bne _byte_skip_hi
+	INC _byte_hi			; forward decrunch
+._byte_skip_hi:
+
+._byte
+	lda stream_data-1		; needs to be set correctly before
+_byte_lo = _byte + 1
+_byte_hi = _byte + 2
+	rts						; decrunch_file is called.
+}
+; end_of_data needs to point to the address just after the address
+; of the last byte of crunched data.
+; -------------------------------------------------------------------
+
+
+; -------------------------------------------------------------------
+; jsr this label to init the decruncher, it will init used zeropage
+; zero page locations and the decrunch tables
+; no constraints on register content, however the
+; decimal flag has to be #0 (it almost always is, otherwise do a cld)
+; -------------------------------------------------------------------
+.init_decruncher
+{
+	jsr get_crunched_byte
+	sta zp_bitbuf
+
+	ldx #0
+	stx zp_dest_lo
+	stx zp_dest_hi
+	stx zp_len_lo
+	stx zp_len_hi
+	ldy #0
+; -------------------------------------------------------------------
+; calculate tables (49 bytes)
+; x and y must be #0 when entering
+;
+._init_nextone
+	inx
+	tya
+	and #$0f
+	beq _init_shortcut		; starta på ny sekvens
+
+	txa			; this clears reg a
+	lsr a			; and sets the carry flag
+	ldx zp_bits_lo
+._init_rolle
+	rol a
+	rol zp_bits_hi
+	dex
+	bpl _init_rolle		; c = 0 after this (rol zp_bits_hi)
+
+	adc tabl_lo-1,y
+	tax
+
+	lda zp_bits_hi
+	adc tabl_hi-1,y
+._init_shortcut
+	sta tabl_hi,y
+	txa
+	sta tabl_lo,y
+
+	ldx #4
+	jsr _bit_get_bits		; clears x-reg.
+	sta tabl_bi,y
+	iny
+	cpy #52
+	bne _init_nextone
+}
+\\ Fall through!	
+
+._do_exit
+	rts
+
+; -------------------------------------------------------------------
+; decrunch one byte
+;
+.get_decrunched_byte
+{
+	ldy zp_len_lo
+	bne _do_sequence
+	ldx zp_len_hi
+	bne _do_sequence2
+
+	jsr _bit_get_bit1
+	beq _get_sequence
+; -------------------------------------------------------------------
+; literal handling (13 bytes)
+;
+	jsr get_crunched_byte
+	bcc _do_literal
+; -------------------------------------------------------------------
+; count zero bits + 1 to get length table index (10 bytes)
+; y = x = 0 when entering
+;
+._get_sequence
+._seq_next1
+	iny
+	jsr _bit_get_bit1
+	beq _seq_next1
+	cpy #$11
+	bcs _do_exit
+; -------------------------------------------------------------------
+; calulate length of sequence (zp_len) (17 bytes)
+;
+	ldx tabl_bi - 1,y
+	jsr _bit_get_bits
+	adc tabl_lo - 1,y
+	sta zp_len_lo
+	lda zp_bits_hi
+	adc tabl_hi - 1,y
+	sta zp_len_hi
+; -------------------------------------------------------------------
+; here we decide what offset table to use (20 bytes)
+; x is 0 here
+;
+	bne _seq_nots123
+	ldy zp_len_lo
+	cpy #$04
+	bcc _seq_size123
+._seq_nots123
+	ldy #$03
+._seq_size123
+	ldx tabl_bit - 1,y
+	jsr _bit_get_bits
+	adc tabl_off - 1,y
+	tay
+; -------------------------------------------------------------------
+; calulate absolute offset (zp_src) (27 bytes)
+;
+	ldx tabl_bi,y
+	jsr _bit_get_bits;
+	adc tabl_lo,y
+	bcc _seq_skipcarry
+	inc zp_bits_hi
+	clc
+._seq_skipcarry
+	adc zp_dest_lo
+	sta zp_src_lo
+	lda zp_bits_hi
+	adc tabl_hi,y
+	adc zp_dest_hi
+; -------------------------------------------------------------------
+	cmp #HI(buffer_len)
+	bcc _seq_offset_ok
+	sbc #HI(buffer_len)
+	clc
+; -------------------------------------------------------------------
+._seq_offset_ok
+	sta zp_src_hi
+	adc #HI(buffer_start)
+	sta zp_src_bi
+._do_sequence
+	ldy #0
+._do_sequence2
+	ldx zp_len_lo
+	bne _seq_len_dec_lo
+	dec zp_len_hi
+._seq_len_dec_lo
+	dec zp_len_lo
+; -------------------------------------------------------------------
+	ldx zp_src_lo
+	bne _seq_src_dec_lo
+	ldx zp_src_hi
+	bne _seq_src_dec_hi
+; ------- handle buffer wrap problematics here ----------------------
+	ldx #HI(buffer_len)
+	stx zp_src_hi
+	ldx #HI(buffer_end)
+	stx zp_src_bi
+; -------------------------------------------------------------------
+._seq_src_dec_hi
+	dec zp_src_hi
+	dec zp_src_bi
+._seq_src_dec_lo
+	dec zp_src_lo
+; -------------------------------------------------------------------
+	lda (zp_src_lo),y
+; -------------------------------------------------------------------
+._do_literal
+	ldx zp_dest_lo
+	bne _seq_dest_dec_lo
+	ldx zp_dest_hi
+	bne _seq_dest_dec_hi
+; ------- handle buffer wrap problematics here ----------------------
+	ldx #HI(buffer_len)
+	stx zp_dest_hi
+	ldx #HI(buffer_end)
+	stx zp_dest_bi
+; -------------------------------------------------------------------
+._seq_dest_dec_hi
+	dec zp_dest_hi
+	dec zp_dest_bi
+._seq_dest_dec_lo
+	dec zp_dest_lo
+; -------------------------------------------------------------------
+	sta (zp_dest_lo),y
+	clc
+	rts
+}
+
+; -------------------------------------------------------------------
+; two small static tables (6 bytes)
+;
+.tabl_bit
+{
+	EQUB 2,4,4
+}
+.tabl_off
+{
+	EQUB 48,32,16
+}
+
+; -------------------------------------------------------------------
+; get x + 1 bits (1 byte)
+;
+._bit_get_bit1
+	inx
+; -------------------------------------------------------------------
+; get bits (31 bytes)
+;
+; args:
+;   x = number of bits to get
+; returns:
+;   a = #bits_lo
+;   x = #0
+;   c = 0
+;   zp_bits_lo = #bits_lo
+;   zp_bits_hi = #bits_hi
+; notes:
+;   y is untouched
+;   other status bits are set to (a == #0)
+; -------------------------------------------------------------------
+._bit_get_bits
+{
+	lda #$00
+	sta zp_bits_lo
+	sta zp_bits_hi
+	cpx #$01
+	bcc _bit_bits_done
+	lda zp_bitbuf
+._bit_bits_next
+	lsr a
+	bne _bit_ok
+	jsr get_crunched_byte
+	ror a
+._bit_ok
+	rol zp_bits_lo
+	rol zp_bits_hi
+	dex
+	bne _bit_bits_next
+	sta zp_bitbuf
+	lda zp_bits_lo
+._bit_bits_done
+	rts
+}
+; -------------------------------------------------------------------
+; end of decruncher
+; -------------------------------------------------------------------
+
+; -------------------------------------------------------------------
+; this 156 byte table area may be relocated. It may also be clobbered
+; by other data between decrunches.
+; -------------------------------------------------------------------
+.decrunch_table
+.tabl_bi  SKIP 156
+tabl_lo = decrunch_table + 52
+tabl_hi = decrunch_table + 104
+
+; -------------------------------------------------------------------
+; end of decruncher
+; -------------------------------------------------------------------
+
+
+\ ******************************************************************
+\ *	Look up tables
+\ ******************************************************************
+
+.chars
+EQUS "0123456789abcdef"
+
+ALIGN &100
+.samples_to_us_LO
+FOR n, 0, 255, 1
+	EQUB LO(n * 1000000.0 / 44100.0)
+NEXT
+
+.samples_to_us_HI
+FOR n, 0, 255, 1
+	EQUB HI(n * 1000000.0 / 44100.0)
+NEXT
+
+.samples_to_us_ERR
+FOR n, 0, 255, 1
+	EQUB LO(256 * n * 1000000.0 / 44100.0)
+NEXT
+
+
+\ ******************************************************************
+\ *	EXO data file
+\ *
+\ * This must be compressed using the following flags:
+\ * exomizer.exe raw -c -m 1024 <file.raw> -o <file.exo>
+\ ******************************************************************
+
+ALIGN &100
+.stream_data
+;INCBIN "sonic.exo"
+;INCBIN "firetrack.exo"
+;INCBIN "pharaoh.exo"
+;INCBIN "addicts-ish.exo"
+;INCBIN "my_mission.exo"
+;INCBIN "run_under_fire.exo"
+;INCBIN "repton.exo"
+;INCBIN "fluid.exo"
+INCBIN "tumbq16k.exo"
+.end_of_data
+
+
+\ ******************************************************************
+\ *	End address to be saved
+\ ******************************************************************
+
+.end
+
+
+\ ******************************************************************
+\ *	Space reserved for runtime buffers not preinitialised
+\ ******************************************************************
+
+ALIGN &100
+.circular_buffer
+SKIP 256
+
+ORG &8000
+.buffer_start
+SKIP buffer_len
+.buffer_end
+
+
+\ ******************************************************************
+\ *	Save the code
+\ ******************************************************************
+
+SAVE "!BOOT", start, end, start+&FF0000, start+&FF0000
