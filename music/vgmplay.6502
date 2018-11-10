@@ -536,15 +536,6 @@ _byte_hi = _byte + 2
 ; -------------------------------------------------------------------
 
 ; -------------------------------------------------------------------
-; this 156 byte table area may be relocated. It may also be clobbered
-; by other data between decrunches.
-; -------------------------------------------------------------------
-.decrunch_table
-.tabl_bi  SKIP 156
-tabl_lo = decrunch_table + 52
-tabl_hi = decrunch_table + 104
-
-; -------------------------------------------------------------------
 ; end of decruncher
 ; -------------------------------------------------------------------
 
@@ -593,6 +584,15 @@ INCBIN "tumb16k.exo"
 \ ******************************************************************
 \ *	Space reserved for runtime buffers not preinitialised
 \ ******************************************************************
+
+; -------------------------------------------------------------------
+; this 156 byte table area may be relocated. It may also be clobbered
+; by other data between decrunches.
+; -------------------------------------------------------------------
+.decrunch_table
+.tabl_bi  SKIP 156
+tabl_lo = decrunch_table + 52
+tabl_hi = decrunch_table + 104
 
 ALIGN &100
 .circular_buffer
