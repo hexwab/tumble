@@ -71,7 +71,7 @@ INKEY_esc = 112
 
 MACRO SN_WRITE_ENABLE
 	LDX #&00: STX &FE40			; R0=Output Register "B" (write) (write 1 into bit 0 - write to sound chip)
-	NOP:NOP:NOP:NOP:NOP:NOP		; wait 8us (following LDX instruction takes 2 cycles)
+	NOP:NOP:NOP		; wait 8us (following LDX instruction takes 2 cycles)
 	LDX #&08: STX &FE40			; set sound chip write pin high
 ENDMACRO
 
@@ -81,12 +81,7 @@ ENDMACRO
 
 buffer_len = 16384
 
-VGM_write_sound_data = &50
-VGM_wait_50_Hz = &63
-VGM_wait_60_Hz = &62
-VGM_wait_N_samples = &61
-VGM_end_of_stream = &66
-VGM_wait_N_us = &41				; my own extension, not standard
+VGM_end_of_stream = 1
 
 \ ******************************************************************
 \ *	Define fast (zero page) runtime variables
@@ -114,10 +109,7 @@ GUARD &90
 .write_ptr				SKIP 2			; ptr to write location in circular buffer
 .latch_ptr				SKIP 2			; ptr to next timer instructoin
 
-.long_timer				SKIP 3			; 24-bit ms timer
 .end_of_stream			SKIP 1			; decompressor hit end of stream
-.player_ended			SKIP 1			; player hit end instruction
-.old_irqv				SKIP 2			; restore old IRQV on exit
 
 \\ Generic vars that can be shared (volatile)
 
@@ -140,15 +132,21 @@ GUARD &7C00							; ensure code size doesn't hit start of screen memory
 
 .main
 {
-	\\ Set MODE 7 for memory
-	;LDA #22
-	;JSR oswrch
-	;LDA #7
-	;JSR oswrch
-	LDA #4
-	STA &F4
-	STA &FE30
-	
+	SEI
+	; minimalist find-free-swram-bank, not foolproof
+	LDA #68
+	LDX #0
+	JSR $FFF4
+	LDY #0
+	TXA
+.bankloop
+	BMI gotbank
+	INY
+	ASL A
+	BNE bankloop
+.gotbank
+	STY &FE30
+
 	\\ Initialise exomizer
 	JSR init_decruncher
 
@@ -157,6 +155,7 @@ GUARD &7C00							; ensure code size doesn't hit start of screen memory
 	LDA #LO(circular_buffer)
 	STA read_ptr
 	STA write_ptr
+	LDA #2
 	STA latch_ptr
 	LDA #HI(circular_buffer)
 	STA read_ptr+1
@@ -165,62 +164,21 @@ GUARD &7C00							; ensure code size doesn't hit start of screen memory
 	
 	LDA #0
 	STA end_of_stream
-	STA player_ended
-	
-	\\ Need to parse header correctly
-	\\ TO-DO
 	
 	\\ Fill our circular buffer with initial data
 	
 	.fill_buffer_loop
-	JSR read_next_instruction
-	bcs find_first_wait
-	
-	SEC
-	LDA write_ptr
-	SBC read_ptr
+	jsr get_decrunched_byte
+	LDY #0
+	STA (write_ptr),Y					; store sound command
+	INC write_ptr						; no carry
 	BPL fill_buffer_loop
 
-	\\ Find first wait instruction
-	.find_first_wait
-	LDY #0
-	.find_wait_loop
-	LDA (latch_ptr),Y
-	INC latch_ptr
-	CMP #VGM_write_sound_data: BNE test_wait
-	INC latch_ptr				; skip sound data
-	JMP find_wait_loop
-	.test_wait
-	CMP #VGM_wait_N_us
-	BNE find_wait_loop
-	.found_wait
-
-	;LDA read_ptr
-	;JSR write_A_trash_X
-	;LDA read_ptr+1
-	;JSR write_A_trash_X
-
-	;LDA write_ptr
-	;JSR write_A_trash_X
-	;LDA write_ptr+1
-	;JSR write_A_trash_X
-	
-	;LDA latch_ptr
-	;JSR write_A_trash_X
-	;LDA latch_ptr+1
-	;JSR write_A_trash_X
-
-	;LDA #10: JSR oswrch: LDA #13: JSR oswrch
-
-	\\ Set initial timer		; do we need this?!
-	SEI							; disable interupts
-	
 	LDA #&7F					; A=01111111
 	STA &FE4E					; R14=Interrupt Enable (disable all interrupts)
 
-	;LDA #&C2					; A=11000010
 	LDA #&C0					; A=11000010
-	STA &FE4E					; R14=Interrupt Enable (enable timer 1 + vsync interrupts)
+	STA &FE4E					; R14=Interrupt Enable (enable timer 1)
 
 	LDA #64						; A=01000000
 	STA &FE4B					; R11=Auxillary Control Register (timer 1 latch mode)
@@ -228,33 +186,56 @@ GUARD &7C00							; ensure code size doesn't hit start of screen memory
 	LDX #&FF					; X=11111111
 	STX &FE44					; R4=T1 Low-Order Latches (write)
 	STX &FE45					; R5=T1 High-Order Counter
-	;CLI
 
-	\\ Set initial latch
-	;SEI
-	LDA (latch_ptr),Y
-	INC latch_ptr
-	STA &FE46
-	LDA (latch_ptr),Y
-	INC latch_ptr
-	STA &FE47
+	LDX #&FF: STX &FE43	; R3=Data Direction Register "A" set to output
+	BNE sound_loop
 
-	;LDA &204: STA old_irqv
-	;LDA &205: STA old_irqv+1
-	
-	;LDA #LO(main_irq):STA &204
-	;LDA #HI(main_irq):STA &205		; set interrupt handler
-
-	;CLI							; enable interupts
-	SEI
-	\\ Sit and watch the pointers as player runs
-	
-	.main_loop
+.main_loop
 	LDA #&40
 	BIT &FE4D
 	BEQ notirq
-	JMP irqtimer
-	.*notirq
+
+.irqtimer
+	STA &FE4D					; clear time-out of T1 in IFR
+
+	\\ When timer lands we process our read ptr and send sound data until we hit something else
+	
+	LDY #0
+.sound_loop
+	LDA (read_ptr),Y
+	INC read_ptr
+	CMP #$40: BCC not_sound
+;	LDX #&FF: STX &FE43	; R3=Data Direction Register "A" set to output
+	STA &FE41	; send sound data to SN chip
+	SN_WRITE_ENABLE
+	;JSR write_A_trash_X
+	BNE sound_loop ; always
+	
+	.not_sound
+	\\ Swallow wait instruction
+	INC read_ptr
+
+.find_wait_loop2
+	LDA (latch_ptr),Y
+	INC latch_ptr
+	CMP #$40
+	BCS find_wait_loop2
+	STA &FE47
+	TAX
+	LDA (latch_ptr),Y
+	INC latch_ptr
+	STA &FE46
+
+	CPX #$3F
+	BNE notirq
+	CMP #&FF
+	BNE notirq
+	
+	\\ Finished playing here - need to clean up!
+	.done
+	STA end_of_stream
+
+.*notirq
 	BIT end_of_stream
 	BMI drain
 	SEC
@@ -263,333 +244,30 @@ GUARD &7C00							; ensure code size doesn't hit start of screen memory
 	CMP #248
 	BCS main_loop
 	
-	JSR read_next_instruction
+	jsr get_decrunched_byte
+	LDY #0
+	STA (write_ptr),Y					; store sound command
+	INC write_ptr						; no carry
+
 	BCC main_loop
 	
 	LDA #&FF
 	STA end_of_stream
 	BNE main_loop
 
-	.drain
-	
-	; lda #&02
-	; .wait_vsync
-	; bit &FE4D
-	; beq wait_vsync
-	
-	LDA read_ptr
-	CMP write_ptr
-	BNE main_loop
+.drain
+        LDA read_ptr
+	CLC
+        SBC write_ptr
+        BNE main_loop
 
 	\\ Clean up
-	;.hlt jmp hlt
-	\\ Zero volume on all channels
-	;SEI
-	;LDX #&FF: STX &FE43					; R3=Data Direction Register "A" set to output
-	;LDA #&9F: STA &FE41					; tone 3 volume OFF
-	;SN_WRITE_ENABLE
-	;LDA #&BF: STA &FE41					; tone 2 volume OFF
-	;SN_WRITE_ENABLE
-	;LDA #&DF: STA &FE41					; tone 1 volume OFF
-	;SN_WRITE_ENABLE
-	;LDA #&FF: STA &FE41					; noise volume OFF
-	;SN_WRITE_ENABLE
-	
 	LDA #&FF					; A=11111111
 	STA &FE4E					; R14=Interrupt Enable (enable all interrupts)
-	
-	;LDA old_irqv: STA &204
-	;LDA old_irqv+1: STA &205
 	CLI
 	
 	RTS
 }
-
-	
-.read_next_instruction
-{
-	jsr get_decrunched_byte
-	bcs _sample_end
-	
-	LDY #0
-	
-	CMP #VGM_write_sound_data: BEQ write_sound_data		; write data byte to SN instruction
-	CMP #VGM_wait_N_samples: BEQ wait_samples			; wait LL HH samples
-	CMP #VGM_wait_50_Hz: BEQ wait_20_ms			; wait 20ms instruction
-	CMP #VGM_wait_60_Hz: BEQ wait_16_ms			; wait 60Hz instruction
-	CMP #VGM_end_of_stream: BNE unsupported			; end of stream instruction
-
-	._sample_end
-	STA (write_ptr),Y					; store sound command
-	INC write_ptr						; no carry
-	SEC
-	RTS
-
-	\\ Could parse other instructions here but still ignore
-	.unsupported
-;	JSR write_A_trash_X					; unsupported instruction
-	CLC
-	RTS
-	
-	.write_sound_data
-	STA (write_ptr),Y					; store sound command
-	INC write_ptr						; no carry
-	
-	jsr get_decrunched_byte
-	bcs _sample_end
-
-	STA (write_ptr),Y					; store sound data
-	INC write_ptr
-	
-	CLC
-	RTS
-	
-	\\ Wait exactly 20 ms
-	.wait_20_ms
-	LDA #VGM_wait_N_us
-	STA (write_ptr),Y					; store wait ms command
-	INC write_ptr						; no carry
-	
-	LDA #&20-2
-	STA (write_ptr),Y					; store wait ms low
-	INC write_ptr						; no carry
-	
-	LDA #&4E							; &4E20 = 20,000 us = 2ms = 50Hz (maybe need -2)
-	STA (write_ptr),Y					; store wait ms high
-	INC write_ptr						; no carry
-	
-	CLC
-	RTS
-	
-	\\ Wait exactly 60Hz
-	.wait_16_ms
-	LDA #VGM_wait_N_us				
-	STA (write_ptr),Y					; store wait ms command
-	INC write_ptr						; no carry
-	
-	LDA #&1B-2
-	STA (write_ptr),Y					; store wait ms low
-	INC write_ptr						; no carry
-	
-	LDA #&41							; &411B = 16,667 us ~= 60Hz (maybe need -2)
-	STA (write_ptr),Y					; store wait ms high
-	INC write_ptr						; no carry
-	
-	CLC
-	RTS
-
-	\\ Wait a number of samples
-	.wait_samples
-	jsr get_decrunched_byte				; low byte #samples
-	;bcs _sample_end
-
-	TAX
-	LDA samples_to_us_LO,X
-	STA long_timer						; lowest byte
-
-	LDA samples_to_us_HI,X
-	STA long_timer+1					; mid byte
-	
-	jsr get_decrunched_byte				; high byte #samples
-	;bcs _sample_end
-
-	TAX
-	CLC
-	LDA samples_to_us_ERR,X				; error from high byte approximateion
-	ADC long_timer
-	STA long_timer						; lowest byte - should probably -2!
-	
-	LDA samples_to_us_LO,X				; mid byte
-	ADC long_timer+1
-	STA long_timer+1					; mid byte
-	
-	LDA samples_to_us_HI,X
-	ADC #0
-	STA long_timer+2					; highest byte
-
-	\\ If only have low byte (<256 us) delay then just don't do it
-	BNE write_long_wait
-	LDA long_timer+1
-	ORA long_timer
-	BNE write_last_wait
-	BEQ wait_too_short
-	
-	.write_long_wait
-	TAX
-	.long_wait_loop
-	LDA #VGM_wait_N_us
-	STA (write_ptr),Y					; store wait us command
-	INC write_ptr						; no carry
-
-	LDA #&FE
-	STA (write_ptr),Y					; store wait us low
-	INC write_ptr						; no carry
-
-	LDA #&FF							; &FFFE = 65534 us = &10000 - 2 us
-	STA (write_ptr),Y					; store wait us high
-	INC write_ptr						; no carry
-
-	DEX
-	BNE long_wait_loop
-	
-	.write_last_wait
-	LDA #VGM_wait_N_us
-	STA (write_ptr),Y					; store wait us command
-	INC write_ptr						; no carry
-
-	LDA long_timer
-	STA (write_ptr),Y					; store wait us low
-	INC write_ptr						; no carry
-
-	LDA long_timer+1
-	STA (write_ptr),Y					; store wait us high
-	INC write_ptr						; no carry
-	
-	.wait_too_short
-	CLC									; clear carry flag
-	RTS
-}
-
-.write_A_trash_X
-{
-	PHA:PHA
-	LSR A:LSR A:LSR A:LSR A
-	TAX
-	LDA chars,X
-	JSR oswrch
-	PLA
-	AND #&0F
-	TAX
-	LDA chars,X
-	JSR oswrch
-	LDA #32
-	JSR oswrch
-	PLA
-	RTS
-}
-
-.main_input
-{
-	\\ Check for escape, if so break
-	LDA #INKEY_esc:STA &FE4F:LDA &FE4F:BMI main_break
-	
-	.return
-	RTS
-
-	.main_break
-	JMP (&FFFC)
-}
-
-
-\ ******************************************************************
-\ *	IRQ handler
-\ ******************************************************************
-
-.main_irq
-{
-	TXA:PHA
-	TYA:PHA
-	
-	LDA #&40:BIT &FE4D:BEQ irqvsync
-.*irqtimer
-	STA &FE4D					; clear time-out of T1 in IFR
-
-	LDA player_ended
-	BNE return
-	
-	\\ When timer lands we process our read ptr and send sound data until we hit something else
-	
-	LDX #&FF: STX &FE43					; R3=Data Direction Register "A" set to output
-	
-	LDY #0
-	.sound_loop
-	LDA (read_ptr),Y
-	INC read_ptr
-	CMP #VGM_write_sound_data: BNE not_sound
-	LDA (read_ptr),Y
-	INC read_ptr
-
-	;SEI
-	STA &FE41							; send sound data to SN chip
-	SN_WRITE_ENABLE
-	;CLI
-	BNE sound_loop
-	
-	.not_sound
-	CMP #VGM_wait_N_us: BNE not_wait				; this only happens at end of stream
-
-	\\ Swallow wait instruction
-	INC read_ptr
-	INC read_ptr
-	JMP find_wait_loop
-	
-	.not_wait
-	CMP #VGM_end_of_stream: BNE find_wait_loop		; shouldn't be any unknown instructions
-	
-	\\ Finished playing here - need to clean up!
-	
-	LDA #&FF
-	STA player_ended
-	JMP return
-	
-	.find_wait_loop
-	LDA (latch_ptr),Y
-	INC latch_ptr
-	CMP #VGM_write_sound_data: BNE test_wait
-	INC latch_ptr				; consume sound data as we don't care about it
-	JMP find_wait_loop
-	.test_wait
-	CMP #VGM_wait_N_us: BNE return
-
-	\\ Set future latch
-	;SEI
-	LDA (latch_ptr),Y
-	;JSR write_A_trash_X
-	INC latch_ptr
-	SEC
-	SBC #2
-	STA &FE46
-	LDA (latch_ptr),Y
-	SBC #0
-	STA &FE47
-	;JSR write_A_trash_X
-	;JSR &FFE7
-	INC latch_ptr
-	;CLI
-
-	.return
-	JMP notirq
-	;JMP return
-
-	.irqvsync
-	JMP return
-	LDA #&02
-	STA &FE4D
-
-	LDA end_of_stream
-	BNE return
-	
-	.decode_loop					; fill buffer until write_ptr catches up with read_ptr - 16?! :\
-	SEC
-	LDA write_ptr
-	SBC read_ptr
-	BMI return
-	
-	JSR read_next_instruction		; note this is not decoding bytes but instructions (2 - 3 bytes)
-	BCC decode_loop
-	
-	LDA #&FF
-	STA end_of_stream
-
-	;.return
-	;JMP notirq
-	RTS
-	PLA:TAY
-	PLA:TAX
-	LDA &FC
-	RTI
-}
-
 
 ; -------------------------------------------------------------------
 ; for this get_crunched_byte routine to work the crunched data has to be
@@ -875,43 +553,32 @@ tabl_hi = decrunch_table + 104
 \ *	Look up tables
 \ ******************************************************************
 
+IF 0
+CPU 1
+.write_A_trash_X
+{
+	PHX
+	PHA:PHA
+	LSR A:LSR A:LSR A:LSR A
+	TAX
+	LDA chars,X
+	JSR oswrch
+	PLA
+	AND #&0F
+	TAX
+	LDA chars,X
+	JSR oswrch
+	LDA #32
+	JSR oswrch
+	PLA
+	PLX
+	RTS
+}
 .chars
 EQUS "0123456789abcdef"
+ENDIF
 
-ALIGN &100
-.samples_to_us_LO
-FOR n, 0, 255, 1
-	EQUB LO(n * 1000000.0 / 44100.0)
-NEXT
-
-.samples_to_us_HI
-FOR n, 0, 255, 1
-	EQUB HI(n * 1000000.0 / 44100.0)
-NEXT
-
-.samples_to_us_ERR
-FOR n, 0, 255, 1
-	EQUB LO(256 * n * 1000000.0 / 44100.0)
-NEXT
-
-
-\ ******************************************************************
-\ *	EXO data file
-\ *
-\ * This must be compressed using the following flags:
-\ * exomizer.exe raw -c -m 1024 <file.raw> -o <file.exo>
-\ ******************************************************************
-
-ALIGN &100
 .stream_data
-;INCBIN "sonic.exo"
-;INCBIN "firetrack.exo"
-;INCBIN "pharaoh.exo"
-;INCBIN "addicts-ish.exo"
-;INCBIN "my_mission.exo"
-;INCBIN "run_under_fire.exo"
-;INCBIN "repton.exo"
-;INCBIN "fluid.exo"
 INCBIN "tumb16k.exo"
 .end_of_data
 

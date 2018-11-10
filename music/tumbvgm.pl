@@ -122,9 +122,10 @@ sub note { exp(.05776226504666210911*shift) }
 my $lastdelay=0;
 
 sub psgwrite {
-    if ($lastdelay) {
+    if ($lastdelay>3) {
+	#print STDERR "lastdelay=$lastdelay\n";
 	$data .= pack"CCC", 0x61, $lastdelay&255,($lastdelay>>8);
-	$lastdelay = 0;
+	$lastdelay =0;#-= int($lastdelay);
     }
     $data .= pack"CC", 0x50, $_[0];
 }
@@ -158,7 +159,7 @@ sub freq {
     return if $lastfreq[$chan] == $freq;
     $lastfreq[$chan] = $freq;
     psgwrite($chan + ($freq&15)); 
-    psgwrite(($freq>>4) & 0x3f);
+    psgwrite(0x40+(($freq>>4) & 0x3f));
 }
 
 my @ev;
@@ -489,13 +490,13 @@ vol(T3V, 15);
 vol(NV, 15);
 freq(T3F, 1);
 
-in(100000, \&doframe, 0);
+in(0, \&doframe, 0);
 #in(40000, \&dosweep,0);
 #in(40000, \&dobd,0);
 #in(40000, \&snareon,0);
 #in(80000, \&clickoff, 0);
 #kernel
-while ($nsamp < 44100*120) {
+while ($nsamp < 44100*110) {
     last unless @ev;
     @ev = sort { $a->[0] <=> $b->[0] } @ev;
     my $ev = shift(@ev);
